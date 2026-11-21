@@ -95,3 +95,95 @@ def test_image_download_cookies_keep_domains():
 
     assert {c.domain for c in got.jar} == {".google.com", "gemini.google.com"}
     assert S._image_download_cookies(SimpleNamespace(cookies={"SID": "x"})) is None
+
+
+# ---------------------------------------------------------------------------
+# Multi-browser reads. On Windows, Chrome 127+ encrypts its cookie store with
+# app-bound encryption that browser_cookie3 cannot decrypt (DPAPI error, even
+# elevated), so the live read has to be able to fall through to Firefox. This
+# matters because an exported cookie file is a frozen snapshot: it loses the
+# short-lived __Secure-1PSIDRTS rotation token, auto_refresh then has nothing to
+# rotate with, and the session decays until image generation is refused while
+# chat still works (observed 2026-11-21).
+# ---------------------------------------------------------------------------
+
+
+def _full_session_jar(psid="fx-psid"):
+    jar = CookieJar()
+    jar.set_cookie(_cookie("__Secure-1PSID", psid, ".google.com"))
+    jar.set_cookie(_cookie("__Secure-1PSIDTS", "fx-ts", ".google.com"))
+    jar.set_cookie(_cookie("SID", "fx-sid", ".google.com"))
+    return jar
+
+
+def test_falls_back_to_firefox_when_chrome_cannot_be_read(monkeypatch):
+    """Chrome raising (app-bound encryption) must not end the read."""
+    import browser_cookie3
+
+    def chrome_boom(**kw):
+        raise RuntimeError("Unable to get key for cookie decryption")
+
+    monkeypatch.setattr(browser_cookie3, "chrome", chrome_boom)
+    monkeypatch.setattr(browser_cookie3, "firefox", lambda **kw: _full_session_jar())
+    monkeypatch.delenv("GEMINI_PSID", raising=False)
+    monkeypatch.delenv("GEMINI_BROWSER", raising=False)
+
+    psid, psidts = S._resolve_cookies()
+    assert psid == "fx-psid" and psidts == "fx-ts"
+
+    jar = S._browser_cookie_jar()
+    assert jar is not None
+    assert jar.get("__Secure-1PSID", domain=".google.com") == "fx-psid"
+
+
+def test_chrome_wins_when_both_browsers_are_readable(monkeypatch):
+    import browser_cookie3
+
+    monkeypatch.setattr(browser_cookie3, "chrome", lambda **kw: _full_session_jar("chrome-psid"))
+    monkeypatch.setattr(browser_cookie3, "firefox", lambda **kw: _full_session_jar("fx-psid"))
+    monkeypatch.delenv("GEMINI_PSID", raising=False)
+    monkeypatch.delenv("GEMINI_BROWSER", raising=False)
+
+    assert S._resolve_cookies()[0] == "chrome-psid"
+
+
+def test_gemini_browser_env_selects_and_orders_browsers(monkeypatch):
+    import browser_cookie3
+
+    def chrome_must_not_run(**kw):
+        raise AssertionError("Chrome was read although GEMINI_BROWSER=firefox")
+
+    monkeypatch.setattr(browser_cookie3, "chrome", chrome_must_not_run)
+    monkeypatch.setattr(browser_cookie3, "firefox", lambda **kw: _full_session_jar())
+    monkeypatch.delenv("GEMINI_PSID", raising=False)
+    monkeypatch.setenv("GEMINI_BROWSER", "firefox")
+
+    assert S._resolve_cookies()[0] == "fx-psid"
+
+
+def test_unknown_browser_name_is_skipped_not_fatal(monkeypatch):
+    import browser_cookie3
+
+    monkeypatch.setattr(browser_cookie3, "firefox", lambda **kw: _full_session_jar())
+    monkeypatch.delenv("GEMINI_PSID", raising=False)
+    monkeypatch.setenv("GEMINI_BROWSER", "netscape4, firefox")
+
+    assert S._resolve_cookies()[0] == "fx-psid"
+
+
+def test_per_browser_cookie_file_override_is_passed_through(monkeypatch):
+    import browser_cookie3
+
+    seen = {}
+
+    def firefox(**kw):
+        seen["cookie_file"] = kw.get("cookie_file")
+        return _full_session_jar()
+
+    monkeypatch.setattr(browser_cookie3, "firefox", firefox)
+    monkeypatch.delenv("GEMINI_PSID", raising=False)
+    monkeypatch.setenv("GEMINI_BROWSER", "firefox")
+    monkeypatch.setenv("FIREFOX_COOKIE_FILE", "/tmp/cookies.sqlite")
+
+    S._resolve_cookies()
+    assert seen["cookie_file"] == "/tmp/cookies.sqlite"

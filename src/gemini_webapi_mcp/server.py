@@ -281,40 +281,74 @@ def _resolve_cookies() -> tuple[str, str]:
         logger.info("Using Gemini cookies from environment variables")
         return psid, psidts
 
-    # --- Priority 2: Chrome browser cookies ---
+    # --- Priority 2: browser cookies (Chrome, then Firefox) ---
     try:
-        import browser_cookie3
-
-        cookie_file = os.environ.get("CHROME_COOKIE_FILE") or None
-        cj = browser_cookie3.chrome(domain_name=".google.com", cookie_file=cookie_file)
-        for cookie in cj:
-            # domain_name is a substring filter: `.google.com.bd` etc. also match,
-            # and their session cookies are not valid for gemini.google.com.
-            if cookie.domain != ".google.com":
+        for name, loader in _browser_readers():
+            try:
+                cj = loader(domain_name=".google.com", cookie_file=_browser_cookie_file(name))
+            except Exception as exc:
+                logger.warning("browser-cookie3: failed to read %s cookies — %s", name, type(exc).__name__)
                 continue
-            if cookie.name == "__Secure-1PSID" and cookie.value:
-                psid = cookie.value
-            elif cookie.name == "__Secure-1PSIDTS" and cookie.value:
-                psidts = cookie.value
-        if psid:
-            logger.info("Using Gemini cookies from Chrome browser")
-            return psid, psidts
-        logger.warning("browser-cookie3: no __Secure-1PSID cookie found in Chrome")
+            psid = psidts = ""
+            for cookie in cj:
+                # domain_name is a substring filter: `.google.com.bd` etc. also match,
+                # and their session cookies are not valid for gemini.google.com.
+                if cookie.domain != ".google.com":
+                    continue
+                if cookie.name == "__Secure-1PSID" and cookie.value:
+                    psid = cookie.value
+                elif cookie.name == "__Secure-1PSIDTS" and cookie.value:
+                    psidts = cookie.value
+            if psid:
+                logger.info("Using Gemini cookies from the %s browser", name)
+                return psid, psidts
+            logger.warning("browser-cookie3: no __Secure-1PSID cookie found in %s", name)
     except ImportError:
-        logger.warning("browser-cookie3 not installed — cannot read cookies from Chrome")
-    except Exception as exc:
-        logger.warning("browser-cookie3: failed to read Chrome cookies — %s", type(exc).__name__)
+        logger.warning("browser-cookie3 not installed — cannot read cookies from a browser")
 
     # --- Nothing worked ---
     raise RuntimeError(
         "Gemini cookies not found. Options:\n"
-        "  1. Log into gemini.google.com in Chrome and install browser-cookie3, or\n"
+        "  1. Log into gemini.google.com in Chrome or Firefox and install browser-cookie3 (on Windows use Firefox: Chrome's store is app-bound encrypted), or\n"
         "  2. Set GEMINI_PSID (and optionally GEMINI_PSIDTS) environment variables."
     )
 
 
 # Cookie domains that make up the Gemini web session.
 _GEMINI_COOKIE_DOMAINS = frozenset({".google.com", "gemini.google.com", ".gemini.google.com"})
+
+# Browsers to read a live Gemini session from, in order. Chrome first because it
+# is the common case, Firefox second because on Windows it is usually the only
+# one that CAN be read: since Chrome 127 the cookie store is app-bound encrypted
+# and browser_cookie3 fails on it with a DPAPI error even when run elevated,
+# while Firefox keeps cookies.sqlite readable. Reading a browser live matters
+# beyond convenience - an exported cookie file is a frozen snapshot and loses the
+# short-lived rotation token (__Secure-1PSIDRTS expires minutes after export), so
+# auto_refresh has nothing to rotate with and the session decays until image
+# generation is refused while chat still works.
+_DEFAULT_COOKIE_BROWSERS = ("chrome", "firefox")
+
+
+def _browser_cookie_file(browser: str):
+    """Per-browser cookie-store override: CHROME_COOKIE_FILE, FIREFOX_COOKIE_FILE, ..."""
+    return os.environ.get(f"{browser.upper()}_COOKIE_FILE") or None
+
+
+def _browser_readers():
+    """Yield (name, loader) for each browser to try, in order.
+
+    GEMINI_BROWSER overrides the list, e.g. "firefox" or "firefox,chrome".
+    Unknown names are skipped with a warning rather than failing the read.
+    """
+    import browser_cookie3
+
+    names = [n.strip().lower() for n in os.environ.get("GEMINI_BROWSER", "").split(",") if n.strip()]
+    for name in names or _DEFAULT_COOKIE_BROWSERS:
+        loader = getattr(browser_cookie3, name, None)
+        if loader is None or not callable(loader):
+            logger.warning("GEMINI_BROWSER: unknown browser %r - skipped", name)
+            continue
+        yield name, loader
 
 
 def _read_cookie_file_rows(text: str):
@@ -438,14 +472,24 @@ def _browser_cookie_jar():
         import browser_cookie3
         from curl_cffi.requests import Cookies
 
-        cookie_file = os.environ.get("CHROME_COOKIE_FILE") or None
-        jar = Cookies()
-        for c in browser_cookie3.chrome(domain_name=".google.com", cookie_file=cookie_file):
-            if c.domain in _GEMINI_COOKIE_DOMAINS and c.value:
-                jar.set(c.name, c.value, domain=c.domain, path=c.path or "/")
-        return jar if jar.get("__Secure-1PSID", domain=".google.com") else None
+        for name, loader in _browser_readers():
+            try:
+                cookies = loader(domain_name=".google.com", cookie_file=_browser_cookie_file(name))
+            except Exception as exc:
+                logger.warning("browser-cookie3: could not load the full %s cookie set — %s",
+                               name, type(exc).__name__)
+                continue
+            jar = Cookies()
+            for c in cookies:
+                if c.domain in _GEMINI_COOKIE_DOMAINS and c.value:
+                    jar.set(c.name, c.value, domain=c.domain, path=c.path or "/")
+            if jar.get("__Secure-1PSID", domain=".google.com"):
+                logger.info("Using the full %s cookie set for the Gemini session", name)
+                return jar
+            logger.warning("browser-cookie3: no __Secure-1PSID cookie found in %s", name)
+        return None
     except Exception as exc:
-        logger.warning("browser-cookie3: could not load full Chrome cookie set — %s", type(exc).__name__)
+        logger.warning("browser-cookie3: browser cookie read failed — %s", type(exc).__name__)
         return None
 
 
