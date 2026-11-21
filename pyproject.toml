@@ -42,6 +42,14 @@ Homepage = "https://github.com/AndyShaman/gemini-webapi-mcp"
 Repository = "https://github.com/AndyShaman/gemini-webapi-mcp"
 Issues = "https://github.com/AndyShaman/gemini-webapi-mcp/issues"
 
+# pytest is not a runtime dependency, but the suite can't run without it:
+# a plain `uv run pytest` otherwise falls through to whatever pytest is on PATH
+# and fails to import the package. Declared as a group so `uv run pytest` works.
+[dependency-groups]
+dev = [
+    "pytest>=8",
+]
+
 [tool.hatch.metadata]
 allow-direct-references = true
 
