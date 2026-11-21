@@ -42,13 +42,20 @@ Homepage = "https://github.com/AndyShaman/gemini-webapi-mcp"
 Repository = "https://github.com/AndyShaman/gemini-webapi-mcp"
 Issues = "https://github.com/AndyShaman/gemini-webapi-mcp/issues"
 
-# pytest is not a runtime dependency, but the suite can't run without it:
-# a plain `uv run pytest` otherwise falls through to whatever pytest is on PATH
-# and fails to import the package. Declared as a group so `uv run pytest` works.
+# pytest is in no dependency list, so there is no pinned, discoverable way to run
+# the suite: a bare `uv run pytest` falls through to whatever pytest is on PATH
+# and dies with ModuleNotFoundError on gemini_webapi_mcp. Declared here but kept
+# OUT of the default groups on purpose - the MCP server runs from this same
+# project via `uv --directory . run gemini-webapi-mcp`, so a default group would
+# put pytest in the runtime environment and make every server spawn re-sync.
+# Run the suite with:  uv run --group dev pytest
 [dependency-groups]
 dev = [
     "pytest>=8",
 ]
+
+[tool.uv]
+default-groups = []
 
 [tool.hatch.metadata]
 allow-direct-references = true
