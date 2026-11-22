@@ -14,6 +14,7 @@ import random
 import re
 import string
 import sys
+import time
 import uuid
 from contextlib import asynccontextmanager
 from datetime import datetime
@@ -33,7 +34,20 @@ logger.setLevel(logging.INFO)
 # Constants
 # ---------------------------------------------------------------------------
 IMAGES_DIR = Path.home() / "Pictures" / "gemini"
-DEFAULT_MODEL = "gemini-3.0-flash"
+# Default model for chat, file and URL tools. Since 2026-11-22 Gemini answers every
+# request made with gemini-3.0-flash's header id (fbb127bbb056c959) with "I
+# encountered an error doing what you asked", while gemini-3.0-flash-thinking
+# (5bf011840784117a) works on the same session. Override with GEMINI_CHAT_MODEL
+# once the library ships the new flash id.
+def _chat_model_from_env() -> str:
+    return os.environ.get("GEMINI_CHAT_MODEL", "").strip() or "gemini-3.0-flash-thinking"
+
+
+DEFAULT_MODEL = _chat_model_from_env()
+# How often (seconds, at most) a tool call compares the browser's live session
+# token with the one the client holds; a newer one in the browser reloads the
+# session. Only applies when the session comes from a live browser.
+SESSION_CHECK_INTERVAL = float(os.environ.get("GEMINI_SESSION_CHECK_INTERVAL", "60"))
 
 # Hard ceiling for a single image-generation call (seconds). The StreamGenerate
 # response via gemini_webapi is erratically slow (measured 22s..345s for the
@@ -282,29 +296,11 @@ def _resolve_cookies() -> tuple[str, str]:
         return psid, psidts
 
     # --- Priority 2: browser cookies (Chrome, then Firefox) ---
-    try:
-        for name, loader in _browser_readers():
-            try:
-                cj = loader(domain_name=".google.com", cookie_file=_browser_cookie_file(name))
-            except Exception as exc:
-                logger.warning("browser-cookie3: failed to read %s cookies — %s", name, type(exc).__name__)
-                continue
-            psid = psidts = ""
-            for cookie in cj:
-                # domain_name is a substring filter: `.google.com.bd` etc. also match,
-                # and their session cookies are not valid for gemini.google.com.
-                if cookie.domain != ".google.com":
-                    continue
-                if cookie.name == "__Secure-1PSID" and cookie.value:
-                    psid = cookie.value
-                elif cookie.name == "__Secure-1PSIDTS" and cookie.value:
-                    psidts = cookie.value
-            if psid:
-                logger.info("Using Gemini cookies from the %s browser", name)
-                return psid, psidts
-            logger.warning("browser-cookie3: no __Secure-1PSID cookie found in %s", name)
-    except ImportError:
-        logger.warning("browser-cookie3 not installed — cannot read cookies from a browser")
+    found = _browser_session_cookies()
+    if found:
+        name, psid, psidts = found
+        logger.info("Using Gemini cookies from the %s browser", name)
+        return psid, psidts
 
     # --- Nothing worked ---
     raise RuntimeError(
@@ -312,6 +308,41 @@ def _resolve_cookies() -> tuple[str, str]:
         "  1. Log into gemini.google.com in Chrome or Firefox and install browser-cookie3 (on Windows use Firefox: Chrome's store is app-bound encrypted), or\n"
         "  2. Set GEMINI_PSID (and optionally GEMINI_PSIDTS) environment variables."
     )
+
+
+def _browser_session_cookies(quiet: bool = False):
+    """Return (browser, __Secure-1PSID, __Secure-1PSIDTS) from the first readable
+    browser that has a Gemini session, or None. Values are never logged.
+
+    `quiet` keeps per-call read problems at debug level, for the periodic
+    freshness check that runs on every tool call.
+    """
+    warn = logger.debug if quiet else logger.warning
+    try:
+        readers = list(_browser_readers())
+    except ImportError:
+        warn("browser-cookie3 not installed — cannot read cookies from a browser")
+        return None
+    for name, loader in readers:
+        try:
+            cj = loader(domain_name=".google.com", cookie_file=_browser_cookie_file(name))
+        except Exception as exc:
+            warn("browser-cookie3: failed to read %s cookies — %s", name, type(exc).__name__)
+            continue
+        psid = psidts = ""
+        for cookie in cj:
+            # domain_name is a substring filter: `.google.com.bd` etc. also match,
+            # and their session cookies are not valid for gemini.google.com.
+            if cookie.domain != ".google.com":
+                continue
+            if cookie.name == "__Secure-1PSID" and cookie.value:
+                psid = cookie.value
+            elif cookie.name == "__Secure-1PSIDTS" and cookie.value:
+                psidts = cookie.value
+        if psid:
+            return name, psid, psidts
+        warn("browser-cookie3: no __Secure-1PSID cookie found in %s", name)
+    return None
 
 
 # Cookie domains that make up the Gemini web session.
@@ -501,14 +532,9 @@ async def _new_client():
     # preferred: on Windows the Chrome store can't be read, and the two PSID
     # cookies alone now get HTTP 400. The file carries the whole session, so the
     # constructor's PSID/PSIDTS are drawn from it rather than from the env vars.
-    global _cookie_file_mtime_applied
     cookies_file = os.environ.get("GEMINI_COOKIES_FILE")
-    loaded_mtime = _cookie_file_mtime()
+    loaded_mtime = _cookie_file_mtime()   # which version of the file this client holds
     full_jar = _file_cookie_jar(cookies_file) if cookies_file else _browser_cookie_jar()
-    if cookies_file:
-        # Record which version of the file this client holds, so _current_client
-        # only re-applies it after the cookie bridge rewrites it.
-        _cookie_file_mtime_applied = loaded_mtime
 
     if cookies_file:
         psid = full_jar.get("__Secure-1PSID", domain=".google.com")
@@ -517,6 +543,7 @@ async def _new_client():
     else:
         psid, psidts = _resolve_cookies()
 
+    source = _cookie_source()
     account_index = int(os.environ.get("GEMINI_ACCOUNT_INDEX", "0"))
     client = GeminiClient(secure_1psid=psid, secure_1psidts=psidts or None, account_index=account_index)
     if full_jar is not None:
@@ -526,9 +553,203 @@ async def _new_client():
         logger.info("Using full cookie set for the Gemini session (%d cookies)", len(full_jar.jar))
     if account_index:
         logger.info("Using Google account index: %d", account_index)
-    await client.init(timeout=300, watchdog_timeout=45, auto_close=False, auto_refresh=True)
+    # The library's background RotateCookies loop is only useful for a frozen
+    # session (cookie file, env vars). For a live browser it fails every interval
+    # ("AuthError: Failed to refresh cookies": the browser store carries no usable
+    # __Secure-1PSIDRTS), and a rotation that did succeed here would fork the
+    # session token away from the browser's own. The browser keeps the session
+    # fresh by itself; _ensure_fresh_session follows it instead. The same holds for
+    # a cookie file the session keeper (GEMINI_SESSION_PROFILE) rewrites: it is
+    # kept fresh from outside and merged in place by _ensure_fresh_session.
+    keeper_fed = source == "file" and bool(os.environ.get("GEMINI_SESSION_PROFILE"))
+    await client.init(timeout=300, watchdog_timeout=45, auto_close=False,
+                      auto_refresh=source != "browser" and not keeper_fed)
     _patch_client(client)
+    _session.update(source=source, psid=psid or "", psidts=psidts or "", checked_at=time.monotonic(),
+                    file_mtime=loaded_mtime if source == "file" else None)
     return client
+
+
+def _cookie_source() -> str:
+    """Where the session comes from, in _new_client's order: "file", "env" or "browser"."""
+    if os.environ.get("GEMINI_COOKIES_FILE"):
+        return "file"
+    if os.environ.get("GEMINI_PSID"):
+        return "env"
+    return "browser"
+
+
+# The current client's session: its source, the session tokens it was built
+# with, and when the browser was last compared against them (monotonic seconds).
+_session: dict = {"source": "", "psid": "", "psidts": "", "checked_at": 0.0, "file_mtime": None}
+_refresh_lock = asyncio.Lock()
+KEEPER_TIMEOUT = float(os.environ.get("GEMINI_KEEPER_TIMEOUT", "90"))
+
+
+def _cookie_file_mtime() -> Optional[float]:
+    path = os.environ.get("GEMINI_COOKIES_FILE")
+    if not path:
+        return None
+    try:
+        return os.path.getmtime(path)
+    except OSError:
+        return None
+
+
+def _apply_cookie_jar(client, jar) -> None:
+    """Merge a fresh cookie jar into a live client without re-initialising it.
+
+    Mirrors gemini_webapi's own rotation (it updates both the client's jar and its
+    HTTP session's jar), so open chat sessions and the access token survive.
+    """
+    client.cookies.update(jar)
+    inner = getattr(client, "client", None)
+    if inner is not None:
+        inner.cookies.update(jar)
+
+
+def _pick_up_cookie_file(client) -> None:
+    """Merge a rewritten GEMINI_COOKIES_FILE into the live client, in place.
+
+    The session keeper (cookie_bridge/session_keeper.py) and the cookie bridge
+    rewrite the file whenever the session rotates; one stat per call notices it.
+    A file that cannot be read is skipped and retried on the next call; the
+    client keeps the cookies it has.
+    """
+    mtime = _cookie_file_mtime()
+    if mtime is None or mtime == _session.get("file_mtime"):
+        return
+    try:
+        jar = _file_cookie_jar(os.environ["GEMINI_COOKIES_FILE"])
+        _apply_cookie_jar(client, jar)
+        _session.update(file_mtime=mtime,
+                        psid=jar.get("__Secure-1PSID", domain=".google.com") or _session["psid"],
+                        psidts=jar.get("__Secure-1PSIDTS", domain=".google.com") or _session["psidts"])
+        logger.info("Applied the refreshed cookie file (%d cookies)", len(jar.jar))
+    except Exception as exc:
+        logger.warning("Cookie file changed but could not be applied — %s", type(exc).__name__)
+
+
+async def _refresh_session_profile() -> bool:
+    """Run the session keeper once, if configured, so a reload gets fresh cookies.
+
+    Configured by GEMINI_SESSION_PROFILE (the keeper's dedicated browser profile)
+    plus GEMINI_COOKIES_FILE. Bounded by KEEPER_TIMEOUT; never raises.
+    """
+    profile = os.environ.get("GEMINI_SESSION_PROFILE")
+    target = os.environ.get("GEMINI_COOKIES_FILE")
+    keeper = Path(__file__).resolve().parents[2] / "cookie_bridge" / "session_keeper.py"
+    if not profile or not target or not keeper.is_file():
+        return False
+    try:
+        proc = await asyncio.create_subprocess_exec(
+            sys.executable, str(keeper), "refresh", "--profile", profile, "--target", target,
+            stdout=asyncio.subprocess.DEVNULL, stderr=asyncio.subprocess.DEVNULL,
+        )
+        try:
+            await asyncio.wait_for(proc.wait(), timeout=KEEPER_TIMEOUT)
+        except asyncio.TimeoutError:
+            proc.kill()
+            logger.warning("Session keeper exceeded %.0fs — reloading with the current cookies", KEEPER_TIMEOUT)
+            return False
+        ok = proc.returncode == 0
+        logger.info("Session keeper refresh %s", "succeeded" if ok else "failed")
+        return ok
+    except Exception as exc:
+        logger.warning("Session keeper could not run — %s", type(exc).__name__)
+        return False
+
+
+def _is_stale_session_error(exc: Exception) -> bool:
+    """True for the errors Gemini gives a session whose tokens went stale.
+
+    ImageGenerationBlocked is the library's match on Gemini's plain-English
+    refusal ("Are you signed in? ... not available in your location"). It is
+    what an aged session gets, even when the browser's cookies are fresh, so
+    it counts as stale; a genuine account or region block simply fails again
+    after the one retry. An HTTP 400 on the batch endpoint (an incomplete or
+    outdated cookie set) and the "Are you signed in?" wording count too.
+    """
+    from gemini_webapi import AuthError, ImageGenerationBlocked
+
+    if isinstance(exc, (AuthError, ImageGenerationBlocked)):
+        return True
+    text = str(exc).lower()
+    return "status code 400" in text or "are you signed in" in text
+
+
+async def _refresh_client(ctx: Context, stale=None, reason: str = ""):
+    """Rebuild the client from the cookie source and swap it in.
+
+    Open chat sessions are moved to the new client, the old one is closed. When
+    `stale` is given and another call already replaced it, the current client is
+    returned as is, so concurrent calls that hit the same stale session reload
+    it once. If building the new client fails, the old one stays in place.
+    """
+    async with _refresh_lock:
+        state = ctx.request_context.lifespan_context
+        current = state["gemini_client"]
+        if stale is not None and current is not stale:
+            return current
+        if _session["source"] == "file":
+            # Let the session keeper (if configured) rotate the cookies first, so the
+            # rebuilt client starts from a fresh session, not the same stale file.
+            await _refresh_session_profile()
+        new = await _new_client()
+        state["gemini_client"] = new
+        for chat in state.get("chat_sessions", {}).values():
+            try:
+                chat.geminiclient = new
+            except Exception:
+                pass
+        try:
+            await current.close()
+        except Exception:
+            pass
+        logger.info("Gemini session reloaded from the %s (%s)", _session["source"], reason or "requested")
+        return new
+
+
+async def _ensure_fresh_session(ctx: Context) -> None:
+    """Follow the browser: reload the session when it holds newer session tokens.
+
+    Google rotates __Secure-1PSIDTS in the browser while the browser is in use.
+    A client built from an older token keeps chatting for a while but then gets
+    image generation refused ("Are you signed in?"). Comparing the browser's
+    tokens at most every SESSION_CHECK_INTERVAL seconds keeps the client in step
+    without a request to Google. A cookie-file session follows its file instead:
+    a rewritten file (session keeper, cookie bridge) is merged in place.
+    """
+    if _session["source"] == "file":
+        _pick_up_cookie_file(_get_client(ctx))
+        return
+    if _session["source"] != "browser" or SESSION_CHECK_INTERVAL <= 0:
+        return
+    now = time.monotonic()
+    if now - _session["checked_at"] < SESSION_CHECK_INTERVAL:
+        return
+    _session["checked_at"] = now
+    found = await asyncio.to_thread(_browser_session_cookies, True)
+    if not found:
+        return
+    _, psid, psidts = found
+    if (psid, psidts) != (_session["psid"], _session["psidts"]):
+        await _refresh_client(ctx, stale=_get_client(ctx), reason="the browser has a newer session token")
+
+
+async def _with_session_retry(ctx: Context, call):
+    """Run `call(client)`; on a stale-session error reload the session and retry once."""
+    await _ensure_fresh_session(ctx)
+    client = _get_client(ctx)
+    try:
+        return await call(client)
+    except Exception as exc:
+        if not _is_stale_session_error(exc):
+            raise
+        logger.warning("Gemini answered as if signed out (%s) — reloading the session and retrying once",
+                       type(exc).__name__)
+        client = await _refresh_client(ctx, stale=client, reason=type(exc).__name__)
+        return await call(client)
 
 
 def _with_alr(url: str) -> str:
@@ -589,140 +810,6 @@ def _get_client(ctx: Context):
 
 def _get_sessions(ctx: Context) -> dict:
     return ctx.request_context.lifespan_context["chat_sessions"]
-
-
-# ---------------------------------------------------------------------------
-# Live cookies: pick up the cookie bridge's rewrites, self-heal on auth errors
-# ---------------------------------------------------------------------------
-
-# mtime of the GEMINI_COOKIES_FILE version the live client holds.
-_cookie_file_mtime_applied: Optional[float] = None
-_rebuild_lock = asyncio.Lock()
-
-
-def _cookie_file_mtime() -> Optional[float]:
-    path = os.environ.get("GEMINI_COOKIES_FILE")
-    if not path:
-        return None
-    try:
-        return os.path.getmtime(path)
-    except OSError:
-        return None
-
-
-def _apply_cookie_jar(client, jar) -> None:
-    """Merge a fresh cookie jar into a live client without re-initialising it.
-
-    Mirrors gemini_webapi's own auto-refresh (it updates both the client's jar and
-    its HTTP session's jar), so open chat sessions and the access token survive.
-    """
-    client.cookies.update(jar)
-    inner = getattr(client, "client", None)
-    if inner is not None:
-        inner.cookies.update(jar)
-
-
-async def _current_client(ctx: Context):
-    """Return the live client, first applying a newer cookie file if one arrived.
-
-    The cookie bridge (cookie_bridge/) rewrites GEMINI_COOKIES_FILE whenever the
-    browser's Google cookies rotate. Applying the change in place keeps this
-    session as fresh as the browser's without dropping open chats. A file that
-    cannot be read is skipped (and retried on the next call); the client keeps
-    the cookies it has.
-    """
-    global _cookie_file_mtime_applied
-    client = _get_client(ctx)
-    mtime = _cookie_file_mtime()
-    if mtime is not None and mtime != _cookie_file_mtime_applied:
-        try:
-            jar = _file_cookie_jar(os.environ["GEMINI_COOKIES_FILE"])
-            _apply_cookie_jar(client, jar)
-            _cookie_file_mtime_applied = mtime
-            logger.info("Applied refreshed cookie file (%d cookies)", len(jar.jar))
-        except Exception as exc:
-            logger.warning("Cookie file changed but could not be applied — %s", type(exc).__name__)
-    return client
-
-
-def _is_auth_failure(exc: Exception) -> bool:
-    """True for errors a fresh session can cure (expired/rotated cookies)."""
-    from gemini_webapi.exceptions import AuthError, ImageGenerationBlocked
-
-    if isinstance(exc, (AuthError, ImageGenerationBlocked)):
-        return True
-    text = str(exc).lower()
-    return "status code 400" in text or "are you signed in" in text
-
-
-async def _rebuild_client(ctx: Context):
-    """Re-initialise the client from the current cookies and swap it in.
-
-    The new client is built before the old one is touched, so a failure leaves the
-    old client in place. Open chat sessions are re-pointed at the new client.
-    """
-    async with _rebuild_lock:
-        old = _get_client(ctx)
-        new = await _new_client()
-        ctx.request_context.lifespan_context["gemini_client"] = new
-        for chat in _get_sessions(ctx).values():
-            chat.geminiclient = new
-        try:
-            await old.close()
-        except Exception:
-            pass
-        return new
-
-
-KEEPER_TIMEOUT = float(os.environ.get("GEMINI_KEEPER_TIMEOUT", "90"))
-
-
-async def _refresh_session_profile() -> bool:
-    """Run the session keeper once (if configured) so a rebuild gets fresh cookies.
-
-    Configured by GEMINI_SESSION_PROFILE (the keeper's dedicated browser profile)
-    plus GEMINI_COOKIES_FILE. Bounded by KEEPER_TIMEOUT; never raises.
-    """
-    profile = os.environ.get("GEMINI_SESSION_PROFILE")
-    target = os.environ.get("GEMINI_COOKIES_FILE")
-    keeper = Path(__file__).resolve().parents[2] / "cookie_bridge" / "session_keeper.py"
-    if not profile or not target or not keeper.is_file():
-        return False
-    try:
-        proc = await asyncio.create_subprocess_exec(
-            sys.executable, str(keeper), "refresh", "--profile", profile, "--target", target,
-            stdout=asyncio.subprocess.DEVNULL, stderr=asyncio.subprocess.DEVNULL,
-        )
-        try:
-            await asyncio.wait_for(proc.wait(), timeout=KEEPER_TIMEOUT)
-        except asyncio.TimeoutError:
-            proc.kill()
-            logger.warning("Session keeper exceeded %.0fs — rebuilding with the current cookies", KEEPER_TIMEOUT)
-            return False
-        ok = proc.returncode == 0
-        logger.info("Session keeper refresh %s", "succeeded" if ok else "failed")
-        return ok
-    except Exception as exc:
-        logger.warning("Session keeper could not run — %s", type(exc).__name__)
-        return False
-
-
-async def _with_auth_retry(ctx: Context, call) -> str:
-    """Run a tool body; on an auth-type failure refresh the session (keeper, if
-    configured), re-initialise from the latest cookies and retry once. Any other
-    error, or a second failure, is reported."""
-    try:
-        return await call()
-    except Exception as exc:
-        if not _is_auth_failure(exc):
-            return _handle_error(exc)
-        logger.warning("Auth-type failure (%s) — refreshing the session and retrying once", type(exc).__name__)
-        try:
-            await _refresh_session_profile()
-            await _rebuild_client(ctx)
-            return await call()
-        except Exception as exc2:
-            return _handle_error(exc2)
 
 
 _image_mode = False
@@ -860,7 +947,12 @@ def _patch_client(gemini_client):
     from gemini_webapi.types import GeneratedImage
     import orjson as _json
 
-    _orig_parse_images = _gwc._parse_generated_images
+    # Always wrap the library's own function. Every client (startup, gemini_reset,
+    # each automatic session reload) runs this patch, and wrapping whatever is
+    # installed would stack one more layer per reload until recursion fails.
+    _orig_parse_images = getattr(_gwc, "_mcp_original_parse_generated_images", None) \
+        or _gwc._parse_generated_images
+    _gwc._mcp_original_parse_generated_images = _orig_parse_images
 
     def _patched_parse_images(candidate_data, proxy=None, cookies=None, account_index=0, session_kwargs=None):
         # Try original parser first (old list-based format)
@@ -959,12 +1051,21 @@ def _patch_client(gemini_client):
 
 
 def _handle_error(e: Exception) -> str:
-    from gemini_webapi import AuthError, APIError, RequestTimeoutError
+    from gemini_webapi import AuthError, APIError, ImageGenerationBlocked, RequestTimeoutError
 
     if isinstance(e, AuthError):
         return (
             "Error: Authentication failed. Cookies may have expired. "
             "Re-login to gemini.google.com in Chrome, then call gemini_reset."
+        )
+    if isinstance(e, ImageGenerationBlocked):
+        # The library's message lists region, auth and account as possible
+        # causes whatever the actual reason; say what was already tried.
+        return (
+            "Error: ImageGenerationBlocked — Gemini refused to generate images even after "
+            f"the session was reloaded from the {_session['source'] or 'cookie source'}. "
+            "Sign in to gemini.google.com in the browser (or export fresh cookies), then try again. "
+            f"Gemini said: {str(e).split('Response:', 1)[-1].strip()[:300]}"
         )
     if isinstance(e, RequestTimeoutError):
         return "Error: Request timed out. Try again or use a lighter model."
@@ -1078,13 +1179,15 @@ async def gemini_start_chat(
     have full context. Pass the returned session_id to gemini_chat.
 
     Args:
-        model: Model name for this session. Defaults to gemini-3.0-flash.
+        model: Model name for this session. Defaults to gemini-3.0-flash-thinking
+               (GEMINI_CHAT_MODEL overrides the default).
 
     Returns:
         JSON with session_id to use in subsequent gemini_chat calls.
     """
     try:
-        client = await _current_client(ctx)
+        await _ensure_fresh_session(ctx)
+        client = _get_client(ctx)
         chat = client.start_chat(model=model or DEFAULT_MODEL)
         session_id = str(uuid.uuid4())[:8]
         _get_sessions(ctx)[session_id] = chat
@@ -1117,8 +1220,9 @@ async def gemini_chat(
 
     Args:
         prompt: The text prompt to send to Gemini.
-        model: Model name (e.g. 'gemini-3.0-flash', 'gemini-3.0-pro',
-               'gemini-3.0-flash-thinking'). Defaults to gemini-3.0-flash.
+        model: Model name (e.g. 'gemini-3.0-flash-thinking', 'gemini-3.0-pro',
+               'gemini-3.0-flash'). Defaults to gemini-3.0-flash-thinking
+               (GEMINI_CHAT_MODEL overrides the default).
         session_id: Optional session ID from gemini_start_chat for
                     multi-turn conversation with context.
 
@@ -1126,22 +1230,17 @@ async def gemini_chat(
         Gemini's text response. When using flash-thinking model,
         also includes the model's reasoning process.
     """
-    return await _with_auth_retry(ctx, lambda: _chat_impl(ctx, prompt, model, session_id))
-
-
-async def _chat_impl(ctx: Context, prompt: str, model: Optional[str], session_id: Optional[str]) -> str:
     try:
-        client = await _current_client(ctx)
-
         if session_id:
             sessions = _get_sessions(ctx)
             chat = sessions.get(session_id)
             if not chat:
                 return f"Error: Session '{session_id}' not found. Start a new one with gemini_start_chat."
-            response = await chat.send_message(prompt)
+            # A reload moves open chats to the new client, so the retry reuses `chat`.
+            response = await _with_session_retry(ctx, lambda _client: chat.send_message(prompt))
         else:
-            response = await client.generate_content(
-                prompt, model=model or DEFAULT_MODEL
+            response = await _with_session_retry(
+                ctx, lambda client: client.generate_content(prompt, model=model or DEFAULT_MODEL)
             )
 
         text = response.text or "(empty response)"
@@ -1150,8 +1249,6 @@ async def _chat_impl(ctx: Context, prompt: str, model: Optional[str], session_id
             return f"**Thinking:**\n{thoughts}\n\n**Response:**\n{text}"
         return text
     except Exception as e:
-        if _is_auth_failure(e):
-            raise  # _with_auth_retry reloads cookies and retries once
         return _handle_error(e)
 
 
@@ -1196,23 +1293,12 @@ async def gemini_generate_image(
     Returns:
         JSON with generated image paths, conversation_id for continuation, or an error message.
     """
-    return await _with_auth_retry(
-        ctx, lambda: _generate_image_impl(ctx, prompt, model, files, conversation_id)
-    )
-
-
-async def _generate_image_impl(
-    ctx: Context,
-    prompt: str,
-    model: Optional[str],
-    files: Optional[list[str]],
-    conversation_id: Optional[list[str]],
-) -> str:
     global _image_mode
     import time
     t0 = time.monotonic()
     try:
-        client = await _current_client(ctx)
+        await _ensure_fresh_session(ctx)
+        client = _get_client(ctx)
 
         # Validate input files
         resolved_files = []
@@ -1228,20 +1314,31 @@ async def _generate_image_impl(
             t = _stage("acquired image lock", t0)
             _image_mode = True
             try:
-                if conversation_id:
-                    chat = client.start_chat(
-                        metadata=conversation_id,
-                        model=model or "gemini-3.0-flash-thinking",
-                    )
-                    gen_coro = chat.send_message(prompt, files=resolved_files or None)
-                else:
-                    kwargs = {"model": model or "gemini-3.0-flash-thinking"}
-                    if resolved_files:
-                        kwargs["files"] = resolved_files
-                    gen_coro = client.generate_content(prompt, **kwargs)
-                # Hard cap: never let the library's stall-retry loop run for
-                # minutes when Gemini throttles the account. Fail fast instead.
-                response = await asyncio.wait_for(gen_coro, timeout=GEN_TIMEOUT)
+                for attempt in (1, 2):
+                    if conversation_id:
+                        chat = client.start_chat(
+                            metadata=conversation_id,
+                            model=model or "gemini-3.0-flash-thinking",
+                        )
+                        gen_coro = chat.send_message(prompt, files=resolved_files or None)
+                    else:
+                        kwargs = {"model": model or "gemini-3.0-flash-thinking"}
+                        if resolved_files:
+                            kwargs["files"] = resolved_files
+                        gen_coro = client.generate_content(prompt, **kwargs)
+                    try:
+                        # Hard cap: never let the library's stall-retry loop run for
+                        # minutes when Gemini throttles the account. Fail fast instead.
+                        response = await asyncio.wait_for(gen_coro, timeout=GEN_TIMEOUT)
+                        break
+                    except Exception as exc:
+                        if attempt == 2 or not _is_stale_session_error(exc):
+                            raise
+                        # An aged session gets "Are you signed in?" for images
+                        # while chat still works: reload it and try once more.
+                        logger.warning("Image request answered as if signed out (%s) — "
+                                       "reloading the session and retrying once", type(exc).__name__)
+                        client = await _refresh_client(ctx, stale=client, reason=type(exc).__name__)
             except asyncio.TimeoutError:
                 logger.warning("generate_content exceeded %.0fs cap — aborting", GEN_TIMEOUT)
                 return (
@@ -1369,8 +1466,6 @@ async def _generate_image_impl(
         return json.dumps(result, ensure_ascii=False, indent=2)
 
     except Exception as e:
-        if _is_auth_failure(e):
-            raise  # _with_auth_retry reloads cookies and retries once
         return _handle_error(e)
 
 
@@ -1396,7 +1491,8 @@ async def gemini_upload_file(
         file_path: Absolute path to the file to upload.
         prompt: Question or instruction about the file
                 (e.g. 'What is shown in this image?').
-        model: Model name. Defaults to gemini-3.0-flash.
+        model: Model name. Defaults to gemini-3.0-flash-thinking
+               (GEMINI_CHAT_MODEL overrides the default).
 
     Returns:
         Gemini's text response about the uploaded file.
@@ -1406,9 +1502,8 @@ async def gemini_upload_file(
         if not p.exists():
             return f"Error: File not found — {p}"
 
-        client = await _current_client(ctx)
-        response = await client.generate_content(
-            prompt, model=model or DEFAULT_MODEL, files=[str(p)]
+        response = await _with_session_retry(
+            ctx, lambda client: client.generate_content(prompt, model=model or DEFAULT_MODEL, files=[str(p)])
         )
         return response.text or "(empty response)"
 
@@ -1441,16 +1536,16 @@ async def gemini_analyze_url(
         url: The URL to analyze (YouTube, article, webpage, etc.).
         prompt: Question or instruction about the content
                 (e.g. 'Summarize this video', 'What are the key points?').
-        model: Model name. Defaults to gemini-3.0-flash.
+        model: Model name. Defaults to gemini-3.0-flash-thinking
+               (GEMINI_CHAT_MODEL overrides the default).
 
     Returns:
         Gemini's analysis of the URL content.
     """
     try:
-        client = await _current_client(ctx)
         full_prompt = f"{prompt}\n\n{url}"
-        response = await client.generate_content(
-            full_prompt, model=model or DEFAULT_MODEL
+        response = await _with_session_retry(
+            ctx, lambda client: client.generate_content(full_prompt, model=model or DEFAULT_MODEL)
         )
         return response.text or "(empty response)"
     except Exception as e:
@@ -1476,7 +1571,9 @@ async def gemini_reset(ctx: Context) -> str:
         Confirmation message or error.
     """
     try:
-        await _rebuild_client(ctx)
+        # Builds the new client before closing the old one and moves open chat
+        # sessions over, so a failed reload leaves the working client in place.
+        await _refresh_client(ctx, reason="gemini_reset")
         return "Gemini client re-initialised with fresh cookies."
 
     except Exception as e:
