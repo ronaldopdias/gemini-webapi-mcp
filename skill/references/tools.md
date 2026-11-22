@@ -8,7 +8,7 @@ Text prompt to Gemini. Supports multi-turn and thinking mode.
 | Param | Required | Default | Description |
 |-------|----------|---------|-------------|
 | `prompt` | yes | — | Text prompt |
-| `model` | no | `gemini-3.0-flash` | Model to use |
+| `model` | no | `gemini-3.0-flash-thinking` | Model to use |
 | `session_id` | no | — | Session ID for multi-turn |
 
 ```
@@ -32,7 +32,7 @@ Start multi-turn session. Returns `session_id` for use in `gemini_chat`.
 **Parameters:**
 | Param | Required | Default | Description |
 |-------|----------|---------|-------------|
-| `model` | no | `gemini-3.0-flash` | Model for session |
+| `model` | no | `gemini-3.0-flash-thinking` | Model for session |
 
 ```
 gemini_start_chat()
@@ -98,7 +98,7 @@ Upload file and ask Gemini about it. Supports video, images, PDF, documents.
 |-------|----------|---------|-------------|
 | `file_path` | yes | — | Absolute path to file |
 | `prompt` | no | `"Describe this file."` | Question or instruction |
-| `model` | no | `gemini-3.0-flash` | Model to use |
+| `model` | no | `gemini-3.0-flash-thinking` | Model to use |
 
 ```
 gemini_upload_file(file_path="/path/to/image.png", prompt="What is in this image?")
@@ -115,7 +115,7 @@ Analyze URL — YouTube videos, webpages, articles.
 |-------|----------|---------|-------------|
 | `url` | yes | — | URL to analyze |
 | `prompt` | no | `"Summarize this content."` | Question about the content |
-| `model` | no | `gemini-3.0-flash` | Model to use |
+| `model` | no | `gemini-3.0-flash-thinking` | Model to use |
 
 ```
 gemini_analyze_url(url="https://youtube.com/watch?v=...", prompt="Summarize this video")
@@ -135,15 +135,16 @@ gemini_reset()
 
 | Model | Best for | Notes |
 |-------|----------|-------|
-| `gemini-3.0-flash` | Text chat, analysis | Fast, default for chat |
-| `gemini-3.0-flash-thinking` | Image generation, editing | Nano Banana 2, supports aspect ratios, default for images |
+| `gemini-3.0-flash-thinking` | Chat, analysis, image generation and editing | Default for everything (Nano Banana 2 for images, supports aspect ratios) |
+| `gemini-3.0-flash` | — | Gemini answers its model id with "I encountered an error" since 2026-11-22; `GEMINI_CHAT_MODEL` can bring it back |
 | `gemini-3.0-pro` | Complex reasoning | Slower, higher quality text |
 
 ## Troubleshooting
 
 | Problem | Solution |
 |---------|----------|
-| Auth error / cookies expired | `gemini_reset` |
+| Auth error / cookies expired | The server reloads the session from the browser and retries once by itself; if it persists, sign in to gemini.google.com in the browser, then `gemini_reset` |
+| `ImageGenerationBlocked` ("Are you signed in? ... not available in your location") | Usually an aged session, not a region block: the server reloads and retries once. If it persists, `gemini_reset` |
 | Stream interrupted / timeout | Server auto-retries (watchdog 45s); file editing may need 2-3 retries |
 | No images in response | Prompt may violate content policy, rephrase. For file editing: update server (`git pull && uv sync`) |
 | Square image despite aspect ratio | Include "16:9" or "9:16" in prompt text |

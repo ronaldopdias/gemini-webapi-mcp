@@ -219,8 +219,8 @@ Gemini добавляет sparkle-метку (четырёхконечную з�
 
 | Модель | По умолчанию для | Примечание |
 |--------|------------------|------------|
-| `gemini-3.0-flash` | чат, анализ файлов | Быстрая |
-| `gemini-3.0-flash-thinking` | генерация изображений | Nano Banana 2, поддержка пропорций |
+| `gemini-3.0-flash-thinking` | чат, анализ файлов, генерация изображений | Nano Banana 2 для изображений, поддержка пропорций |
+| `gemini-3.0-flash` | — | С 2026-11-22 Gemini отвечает на этот id модели «I encountered an error»; можно вернуть через `GEMINI_CHAT_MODEL` |
 | `gemini-3.0-pro` | — | Альтернативная модель |
 
 ## Примеры использования
@@ -439,8 +439,12 @@ If cookie auto-detection fails, set them manually:
 | `GEMINI_PSIDTS` | Cookie value `__Secure-1PSIDTS` | auto from Chrome |
 | `GEMINI_LANGUAGE` | Gemini response language (`ru`, `en`, `ja`, ...) | `en` |
 | `GEMINI_ACCOUNT_INDEX` | Google account index (0, 1, 2, ...) | `0` |
+| `GEMINI_CHAT_MODEL` | Default model for chat, file and URL tools | `gemini-3.0-flash-thinking` |
+| `GEMINI_SESSION_CHECK_INTERVAL` | Seconds between checks of the browser's session token (live-browser sessions only; `0` turns it off) | `60` |
 
 > **Since Google's 2026-11-12 web build**, the two `__Secure-1PSID*` cookies alone get every request answered with HTTP 400 ("Are you signed in?"). Export the full google.com cookie set from a browser signed in to [gemini.google.com](https://gemini.google.com) and point `GEMINI_COOKIES_FILE` at the file. When it is set, `GEMINI_PSID`/`GEMINI_PSIDTS` are ignored. Only `.google.com` / `gemini.google.com` cookies are loaded, each kept to its own domain; the file holds a live login, so keep it as private as a password.
+
+> **Long-running sessions.** With a live browser as the source, the server follows the browser's own session instead of rotating cookies itself: at most every `GEMINI_SESSION_CHECK_INTERVAL` seconds a tool call compares the browser's `__Secure-1PSIDTS` with the client's and reloads the session when the browser has a newer one. If Gemini still answers as if signed out (`ImageGenerationBlocked`, "Are you signed in?") or with an `AuthError`, the session is reloaded and the request retried once. gemini_webapi's background `RotateCookies` loop stays on only for a cookie file or env-var cookies.
 
 ## High Resolution (2x)
 
@@ -483,8 +487,8 @@ The only calibrated invariant is the star shape in `src/gemini_webapi_mcp/assets
 
 | Model | Default for | Notes |
 |-------|-------------|-------|
-| `gemini-3.0-flash` | chat, file analysis | Fast |
-| `gemini-3.0-flash-thinking` | image generation | Nano Banana 2, supports aspect ratios |
+| `gemini-3.0-flash-thinking` | chat, file analysis, image generation | Nano Banana 2 for images, supports aspect ratios |
+| `gemini-3.0-flash` | — | Since 2026-11-22 Gemini answers its model id with "I encountered an error"; selectable again via `GEMINI_CHAT_MODEL` once fixed |
 | `gemini-3.0-pro` | — | Alternative model |
 
 ## Usage Examples
