@@ -133,6 +133,35 @@ def test_auth_failure_rebuilds_once_and_retries(monkeypatch):
     assert calls["n"] == 1 and attempts["n"] == 2
 
 
+def test_auth_failure_refreshes_the_session_profile_before_rebuilding(monkeypatch):
+    order = []
+
+    async def fake_refresh():
+        order.append("refresh")
+        return True
+
+    async def fake_rebuild(ctx):
+        order.append("rebuild")
+
+    monkeypatch.setattr(server, "_refresh_session_profile", fake_refresh)
+    monkeypatch.setattr(server, "_rebuild_client", fake_rebuild)
+    attempts = {"n": 0}
+
+    async def call():
+        attempts["n"] += 1
+        if attempts["n"] == 1:
+            raise AuthError("expired")
+        return "ok"
+
+    assert asyncio.run(server._with_auth_retry(_ctx(_fake_client()), call)) == "ok"
+    assert order == ["refresh", "rebuild"]
+
+
+def test_no_session_profile_configured_means_no_keeper_run(monkeypatch):
+    monkeypatch.delenv("GEMINI_SESSION_PROFILE", raising=False)
+    assert asyncio.run(server._refresh_session_profile()) is False
+
+
 def test_other_errors_are_reported_without_rebuilding(monkeypatch):
     calls = _counting_rebuild(monkeypatch)
 

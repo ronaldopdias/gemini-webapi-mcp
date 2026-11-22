@@ -674,16 +674,51 @@ async def _rebuild_client(ctx: Context):
         return new
 
 
+KEEPER_TIMEOUT = float(os.environ.get("GEMINI_KEEPER_TIMEOUT", "90"))
+
+
+async def _refresh_session_profile() -> bool:
+    """Run the session keeper once (if configured) so a rebuild gets fresh cookies.
+
+    Configured by GEMINI_SESSION_PROFILE (the keeper's dedicated browser profile)
+    plus GEMINI_COOKIES_FILE. Bounded by KEEPER_TIMEOUT; never raises.
+    """
+    profile = os.environ.get("GEMINI_SESSION_PROFILE")
+    target = os.environ.get("GEMINI_COOKIES_FILE")
+    keeper = Path(__file__).resolve().parents[2] / "cookie_bridge" / "session_keeper.py"
+    if not profile or not target or not keeper.is_file():
+        return False
+    try:
+        proc = await asyncio.create_subprocess_exec(
+            sys.executable, str(keeper), "refresh", "--profile", profile, "--target", target,
+            stdout=asyncio.subprocess.DEVNULL, stderr=asyncio.subprocess.DEVNULL,
+        )
+        try:
+            await asyncio.wait_for(proc.wait(), timeout=KEEPER_TIMEOUT)
+        except asyncio.TimeoutError:
+            proc.kill()
+            logger.warning("Session keeper exceeded %.0fs — rebuilding with the current cookies", KEEPER_TIMEOUT)
+            return False
+        ok = proc.returncode == 0
+        logger.info("Session keeper refresh %s", "succeeded" if ok else "failed")
+        return ok
+    except Exception as exc:
+        logger.warning("Session keeper could not run — %s", type(exc).__name__)
+        return False
+
+
 async def _with_auth_retry(ctx: Context, call) -> str:
-    """Run a tool body; on an auth-type failure re-initialise from the latest
-    cookies and retry once. Any other error, or a second failure, is reported."""
+    """Run a tool body; on an auth-type failure refresh the session (keeper, if
+    configured), re-initialise from the latest cookies and retry once. Any other
+    error, or a second failure, is reported."""
     try:
         return await call()
     except Exception as exc:
         if not _is_auth_failure(exc):
             return _handle_error(exc)
-        logger.warning("Auth-type failure (%s) — reloading cookies and retrying once", type(exc).__name__)
+        logger.warning("Auth-type failure (%s) — refreshing the session and retrying once", type(exc).__name__)
         try:
+            await _refresh_session_profile()
             await _rebuild_client(ctx)
             return await call()
         except Exception as exc2:
