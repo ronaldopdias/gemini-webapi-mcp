@@ -501,8 +501,14 @@ async def _new_client():
     # preferred: on Windows the Chrome store can't be read, and the two PSID
     # cookies alone now get HTTP 400. The file carries the whole session, so the
     # constructor's PSID/PSIDTS are drawn from it rather than from the env vars.
+    global _cookie_file_mtime_applied
     cookies_file = os.environ.get("GEMINI_COOKIES_FILE")
+    loaded_mtime = _cookie_file_mtime()
     full_jar = _file_cookie_jar(cookies_file) if cookies_file else _browser_cookie_jar()
+    if cookies_file:
+        # Record which version of the file this client holds, so _current_client
+        # only re-applies it after the cookie bridge rewrites it.
+        _cookie_file_mtime_applied = loaded_mtime
 
     if cookies_file:
         psid = full_jar.get("__Secure-1PSID", domain=".google.com")
@@ -583,6 +589,105 @@ def _get_client(ctx: Context):
 
 def _get_sessions(ctx: Context) -> dict:
     return ctx.request_context.lifespan_context["chat_sessions"]
+
+
+# ---------------------------------------------------------------------------
+# Live cookies: pick up the cookie bridge's rewrites, self-heal on auth errors
+# ---------------------------------------------------------------------------
+
+# mtime of the GEMINI_COOKIES_FILE version the live client holds.
+_cookie_file_mtime_applied: Optional[float] = None
+_rebuild_lock = asyncio.Lock()
+
+
+def _cookie_file_mtime() -> Optional[float]:
+    path = os.environ.get("GEMINI_COOKIES_FILE")
+    if not path:
+        return None
+    try:
+        return os.path.getmtime(path)
+    except OSError:
+        return None
+
+
+def _apply_cookie_jar(client, jar) -> None:
+    """Merge a fresh cookie jar into a live client without re-initialising it.
+
+    Mirrors gemini_webapi's own auto-refresh (it updates both the client's jar and
+    its HTTP session's jar), so open chat sessions and the access token survive.
+    """
+    client.cookies.update(jar)
+    inner = getattr(client, "client", None)
+    if inner is not None:
+        inner.cookies.update(jar)
+
+
+async def _current_client(ctx: Context):
+    """Return the live client, first applying a newer cookie file if one arrived.
+
+    The cookie bridge (cookie_bridge/) rewrites GEMINI_COOKIES_FILE whenever the
+    browser's Google cookies rotate. Applying the change in place keeps this
+    session as fresh as the browser's without dropping open chats. A file that
+    cannot be read is skipped (and retried on the next call); the client keeps
+    the cookies it has.
+    """
+    global _cookie_file_mtime_applied
+    client = _get_client(ctx)
+    mtime = _cookie_file_mtime()
+    if mtime is not None and mtime != _cookie_file_mtime_applied:
+        try:
+            jar = _file_cookie_jar(os.environ["GEMINI_COOKIES_FILE"])
+            _apply_cookie_jar(client, jar)
+            _cookie_file_mtime_applied = mtime
+            logger.info("Applied refreshed cookie file (%d cookies)", len(jar.jar))
+        except Exception as exc:
+            logger.warning("Cookie file changed but could not be applied — %s", type(exc).__name__)
+    return client
+
+
+def _is_auth_failure(exc: Exception) -> bool:
+    """True for errors a fresh session can cure (expired/rotated cookies)."""
+    from gemini_webapi.exceptions import AuthError, ImageGenerationBlocked
+
+    if isinstance(exc, (AuthError, ImageGenerationBlocked)):
+        return True
+    text = str(exc).lower()
+    return "status code 400" in text or "are you signed in" in text
+
+
+async def _rebuild_client(ctx: Context):
+    """Re-initialise the client from the current cookies and swap it in.
+
+    The new client is built before the old one is touched, so a failure leaves the
+    old client in place. Open chat sessions are re-pointed at the new client.
+    """
+    async with _rebuild_lock:
+        old = _get_client(ctx)
+        new = await _new_client()
+        ctx.request_context.lifespan_context["gemini_client"] = new
+        for chat in _get_sessions(ctx).values():
+            chat.geminiclient = new
+        try:
+            await old.close()
+        except Exception:
+            pass
+        return new
+
+
+async def _with_auth_retry(ctx: Context, call) -> str:
+    """Run a tool body; on an auth-type failure re-initialise from the latest
+    cookies and retry once. Any other error, or a second failure, is reported."""
+    try:
+        return await call()
+    except Exception as exc:
+        if not _is_auth_failure(exc):
+            return _handle_error(exc)
+        logger.warning("Auth-type failure (%s) — reloading cookies and retrying once", type(exc).__name__)
+        try:
+            await _rebuild_client(ctx)
+            return await call()
+        except Exception as exc2:
+            return _handle_error(exc2)
 
 
 _image_mode = False
@@ -944,7 +1049,7 @@ async def gemini_start_chat(
         JSON with session_id to use in subsequent gemini_chat calls.
     """
     try:
-        client = _get_client(ctx)
+        client = await _current_client(ctx)
         chat = client.start_chat(model=model or DEFAULT_MODEL)
         session_id = str(uuid.uuid4())[:8]
         _get_sessions(ctx)[session_id] = chat
@@ -986,8 +1091,12 @@ async def gemini_chat(
         Gemini's text response. When using flash-thinking model,
         also includes the model's reasoning process.
     """
+    return await _with_auth_retry(ctx, lambda: _chat_impl(ctx, prompt, model, session_id))
+
+
+async def _chat_impl(ctx: Context, prompt: str, model: Optional[str], session_id: Optional[str]) -> str:
     try:
-        client = _get_client(ctx)
+        client = await _current_client(ctx)
 
         if session_id:
             sessions = _get_sessions(ctx)
@@ -1006,6 +1115,8 @@ async def gemini_chat(
             return f"**Thinking:**\n{thoughts}\n\n**Response:**\n{text}"
         return text
     except Exception as e:
+        if _is_auth_failure(e):
+            raise  # _with_auth_retry reloads cookies and retries once
         return _handle_error(e)
 
 
@@ -1050,11 +1161,23 @@ async def gemini_generate_image(
     Returns:
         JSON with generated image paths, conversation_id for continuation, or an error message.
     """
+    return await _with_auth_retry(
+        ctx, lambda: _generate_image_impl(ctx, prompt, model, files, conversation_id)
+    )
+
+
+async def _generate_image_impl(
+    ctx: Context,
+    prompt: str,
+    model: Optional[str],
+    files: Optional[list[str]],
+    conversation_id: Optional[list[str]],
+) -> str:
     global _image_mode
     import time
     t0 = time.monotonic()
     try:
-        client = _get_client(ctx)
+        client = await _current_client(ctx)
 
         # Validate input files
         resolved_files = []
@@ -1211,6 +1334,8 @@ async def gemini_generate_image(
         return json.dumps(result, ensure_ascii=False, indent=2)
 
     except Exception as e:
+        if _is_auth_failure(e):
+            raise  # _with_auth_retry reloads cookies and retries once
         return _handle_error(e)
 
 
@@ -1246,7 +1371,7 @@ async def gemini_upload_file(
         if not p.exists():
             return f"Error: File not found — {p}"
 
-        client = _get_client(ctx)
+        client = await _current_client(ctx)
         response = await client.generate_content(
             prompt, model=model or DEFAULT_MODEL, files=[str(p)]
         )
@@ -1287,7 +1412,7 @@ async def gemini_analyze_url(
         Gemini's analysis of the URL content.
     """
     try:
-        client = _get_client(ctx)
+        client = await _current_client(ctx)
         full_prompt = f"{prompt}\n\n{url}"
         response = await client.generate_content(
             full_prompt, model=model or DEFAULT_MODEL
@@ -1316,12 +1441,7 @@ async def gemini_reset(ctx: Context) -> str:
         Confirmation message or error.
     """
     try:
-        old = _get_client(ctx)
-        await old.close()
-
-        new_client = await _new_client()
-
-        ctx.request_context.lifespan_context["gemini_client"] = new_client
+        await _rebuild_client(ctx)
         return "Gemini client re-initialised with fresh cookies."
 
     except Exception as e:

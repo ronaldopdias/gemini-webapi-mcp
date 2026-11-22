@@ -1,0 +1,10 @@
+{
+  "manifest_version": 3,
+  "name": "Gemini Cookie Bridge",
+  "version": "1.0.0",
+  "description": "Keeps a local Gemini MCP server signed in by handing this browser's Google session cookies to it on this computer (native messaging). Nothing is sent over the network.",
+  "permissions": ["cookies", "nativeMessaging", "alarms"],
+  "host_permissions": ["*://*.google.com/*"],
+  "background": { "service_worker": "background.js" },
+  "key": "MIIBIjANBgkqhkiG9w0BAQEFAAOCAQ8AMIIBCgKCAQEA3HBNv4qMPCNx4d8TGzrOdhd1LCm/UsSZiflCZrCMHXgLzNFxjVUKL0Ytpx1vQwQ1jbAp7q0yXrzjK3ipIzWYlYyqFX1/nAVxe2wnubAgxqnnCun3EyxvMvNU0o5cboqx+R+vc+3hGDK/lkqh0MQRBGkzPwlZfAkaTT6JcHQw4qF3z+SMPFLkeIhRssayGRlVj6gSxOA3d4ittlrN7eucbyCi6v9IHvD5peEiWx4PiyDEL7kl1lPNjFmRicL1Q81PMzHhri785cHo7wX93tkR3hvOcIm6xFb1E3IPW8cPv1RhofC/L/Ttr8D9+rUZmzS04loobYlGBFFXXZFC9XgfrwIDAQAB"
+}

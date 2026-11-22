@@ -1,0 +1,15 @@
+{
+  "manifest_version": 2,
+  "name": "Gemini Cookie Bridge",
+  "version": "1.0.0",
+  "description": "Keeps a local Gemini MCP server signed in by handing this browser's Google session cookies to it on this computer (native messaging). Nothing is sent over the network.",
+  "permissions": ["cookies", "nativeMessaging", "alarms", "*://*.google.com/*"],
+  "background": { "scripts": ["background.js"], "persistent": false },
+  "browser_specific_settings": {
+    "gecko": {
+      "id": "gemini-cookie-bridge@gemini-webapi-mcp",
+      "strict_min_version": "140.0",
+      "data_collection_permissions": { "required": ["none"] }
+    }
+  }
+}
