@@ -30,6 +30,7 @@ def test_build_lays_out_both_extensions(tmp_path):
     ch = json.loads((paths["chromium_dir"] / "manifest.json").read_text(encoding="utf-8"))
     assert ff["manifest_version"] == 2 and ff["browser_specific_settings"]["gecko"]["id"] == inst.FIREFOX_ID
     assert ch["manifest_version"] == 3 and "key" in ch
+    assert "browser_action" in ff and "action" in ch     # toolbar status badge
     assert (paths["firefox_dir"] / "background.js").is_file() and (paths["chromium_dir"] / "background.js").is_file()
     with zipfile.ZipFile(paths["firefox_zip"]) as z:
         assert {"manifest.json", "background.js"} <= set(z.namelist())

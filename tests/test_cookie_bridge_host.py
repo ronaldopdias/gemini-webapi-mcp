@@ -162,6 +162,21 @@ def test_errors_never_carry_cookie_values(tmp_path):
     assert reply["ok"] is False and "secret" not in json.dumps(reply)
 
 
+def test_store_diagnostics_are_logged_as_counts_only(tmp_path):
+    log = tmp_path / "bridge.log"
+    diag = [
+        {"id": "firefox-default", "n": 3, "psid": False},
+        {"id": "firefox-container-2", "n": 21, "psid": True},
+        {"id": "evil\nid psid-secret <script>", "n": "x", "psid": "yes"},
+        "junk",
+    ]
+    host.run(io.BytesIO(_frame({"type": "cookies", "source": "firefox", "cookies": [], "diag": diag})), io.BytesIO(),
+             {"target": str(tmp_path / "c.txt"), "accept_from": "firefox", "log": str(log)})
+    text = log.read_text(encoding="utf-8")
+    assert "firefox-default:3:no-psid" in text and "firefox-container-2:21:psid" in text
+    assert "secret" not in text and "<script>" not in text and len(text.splitlines()) == 1
+
+
 def test_run_without_a_config_target_fails_cleanly(tmp_path):
     out = io.BytesIO()
     reply = host.run(io.BytesIO(_frame({"type": "cookies", "source": "firefox", "cookies": _session()})), out, {})

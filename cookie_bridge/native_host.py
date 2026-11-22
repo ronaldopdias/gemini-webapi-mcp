@@ -16,6 +16,7 @@ install.py: {"target": <cookie file>, "accept_from": "firefox"|"chrome"|"edge"|"
 """
 import json
 import os
+import re
 import struct
 import sys
 import tempfile
@@ -124,6 +125,28 @@ def handle(msg, target, accept_from="any"):
     return {"ok": True, "count": len(cookies)}
 
 
+_STORE_ID = re.compile(r"[A-Za-z0-9._+-]{1,40}")
+
+
+def _diag_summary(diag):
+    """Render the extension's per-store counts (no values) for the log.
+
+    Each entry is {"id": store id, "n": cookie count, "psid": session present}.
+    Anything that isn't that shape is shown as '?', so the log stays one line.
+    """
+    if not isinstance(diag, list):
+        return ""
+    parts = []
+    for d in diag[:20]:
+        if not isinstance(d, dict):
+            continue
+        sid = d.get("id")
+        sid = sid if isinstance(sid, str) and _STORE_ID.fullmatch(sid) else "?"
+        n = d.get("n") if isinstance(d.get("n"), int) and not isinstance(d.get("n"), bool) else "?"
+        parts.append(f"{sid}:{n}:{'psid' if d.get('psid') is True else 'no-psid'}")
+    return f" stores={','.join(parts)}" if parts else ""
+
+
 def _log(config, line):
     path = config.get("log")
     if not path:
@@ -147,9 +170,11 @@ def run(stdin, stdout, config):
         else:
             reply = handle(msg, target, config.get("accept_from", "any"))
             source = msg.get("source") if isinstance(msg, dict) else None
+            source = source if isinstance(source, str) and _STORE_ID.fullmatch(source) else "?"
+            diag = _diag_summary(msg.get("diag")) if isinstance(msg, dict) else ""
             _log(config, f"source={source} ok={reply['ok']} "
                          f"{'count=' + str(reply['count']) if reply['ok'] else 'error=' + reply['error']}"
-                         f"{' unchanged' if reply.get('unchanged') else ''}")
+                         f"{' unchanged' if reply.get('unchanged') else ''}{diag}")
     except Exception as exc:  # never let a value reach the reply or the log
         reply = {"ok": False, "error": f"host error: {type(exc).__name__}"}
         _log(config, reply["error"])
